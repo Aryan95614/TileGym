@@ -31,6 +31,7 @@ from . import swiglu  # noqa: F401
 from . import tiled_mlp  # noqa: F401
 from . import tvd  # noqa: F401
 from .cross_entropy import CrossEntropyCuTileFunction  # noqa: F401
+from .dpo_loss import DPOLossCuTileFunction  # noqa: F401
 from .fused_add_rms_norm import FusedAddRMSNormCuTileFunction  # noqa: F401
 from .fused_linear_cross_entropy import FusedLinearCrossEntropyCuTileFunction  # noqa: F401
 from .fused_linear_jsd import FusedLinearJSDCuTileFunction  # noqa: F401
@@ -82,6 +83,7 @@ __all__ = [
     "rope",
     "sparsemax",
     "tiled_mlp",
+    "DPOLossCuTileFunction",
     "FusedAddRMSNormCuTileFunction",
     "FusedLinearCrossEntropyCuTileFunction",
     "GrpoLossCuTileFunction",
