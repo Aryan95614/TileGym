@@ -5,6 +5,7 @@
 """CuTile implementations for liger suite."""
 
 from . import cross_entropy  # noqa: F401
+from . import dpo_loss  # noqa: F401
 from . import dyt  # noqa: F401
 from . import fused_add_rms_norm  # noqa: F401
 from . import fused_linear_cross_entropy  # noqa: F401
