@@ -70,9 +70,7 @@ def _preference_loss(
         loss = losses.sum() / n_pairs
     elif loss_type == "nca_pair":
         losses = (
-            -F.logsigmoid(chosen_rewards)
-            - 0.5 * F.logsigmoid(-chosen_rewards)
-            - 0.5 * F.logsigmoid(-rejected_rewards)
+            -F.logsigmoid(chosen_rewards) - 0.5 * F.logsigmoid(-chosen_rewards) - 0.5 * F.logsigmoid(-rejected_rewards)
         )
         loss = losses.sum() / n_pairs
     elif loss_type == "robust":
@@ -139,9 +137,7 @@ def _reference_dpo_loss(
     V = weight.shape[0]
     n_pairs = B // 2
 
-    log_prob, log_probs, logits = _sequence_logps(
-        input_data, weight, target, bias, ignore_index, average_log_prob
-    )
+    log_prob, log_probs, logits = _sequence_logps(input_data, weight, target, bias, ignore_index, average_log_prob)
     chosen_logps = log_prob[:n_pairs]
     rejected_logps = log_prob[n_pairs:]
 
@@ -303,9 +299,7 @@ class Test_Liger_DpoLoss(common.PyTestCase):
         device = self._setup_backend(backend)
         n_pairs, T, H, V = 2, 8, 64, 128
         dtype = torch.float32
-        input_data, weight, target, _, _, _, _ = _make_inputs(
-            n_pairs, T, H, V, dtype, device, with_ref=False
-        )
+        input_data, weight, target, _, _, _, _ = _make_inputs(n_pairs, T, H, V, dtype, device, with_ref=False)
 
         test_out = dpo_loss(input_data, weight, target, use_ref_model=False)
         ref_out = _reference_dpo_loss(input_data, weight, target, use_ref_model=False)
@@ -337,6 +331,34 @@ class Test_Liger_DpoLoss(common.PyTestCase):
         test_out = dpo_loss(*inputs)
         ref_out = _reference_dpo_loss(*inputs)
         _assert_outputs_match(test_out, ref_out, dtype)
+
+    @pytest.mark.parametrize("chunk_size", [1, 2, 3, None])
+    @pytest.mark.parametrize("backend", _backends)
+    def test_op_chunk_sizes(self, chunk_size, backend, monkeypatch):
+        """Forced chunking (including a non-divisor chunk count) never changes
+        results relative to the reference or the single-pass path."""
+        device = self._setup_backend(backend)
+        n_pairs, T, H, V = 4, 8, 64, 128
+        dtype = torch.float32
+        input_data, weight, target, bias, ref_input, ref_weight, ref_bias = _make_inputs(
+            n_pairs, T, H, V, dtype, device, with_bias=True, with_ref=True, prompt_len=2
+        )
+
+        x_test = input_data.clone().requires_grad_(True)
+        w_test = weight.clone().requires_grad_(True)
+        out_test = dpo_loss(x_test, w_test, target, bias, ref_input, ref_weight, ref_bias, chunk_size=chunk_size)
+        out_test[0].backward()
+
+        x_ref = input_data.clone().requires_grad_(True)
+        w_ref = weight.clone().requires_grad_(True)
+        out_ref = _reference_dpo_loss(x_ref, w_ref, target, bias, ref_input, ref_weight, ref_bias)
+        out_ref[0].backward()
+
+        _assert_outputs_match(out_test, out_ref, dtype, what=f"[chunk={chunk_size}] ")
+        for name, t, r in (("dInput", x_test.grad, x_ref.grad), ("dWeight", w_test.grad, w_ref.grad)):
+            assert torch.allclose(t.float(), r.float(), **_tols(dtype)), (
+                f"[chunk={chunk_size}] {name} mismatch: max={(t.float() - r.float()).abs().max().item():.6f}"
+            )
 
     @pytest.mark.parametrize(
         "dtype",

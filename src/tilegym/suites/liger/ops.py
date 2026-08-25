@@ -533,6 +533,7 @@ def dpo_loss(
     loss_type: str = "sigmoid",
     label_smoothing: float = 0.0,
     discopop_tau: float = 0.05,
+    chunk_size: Optional[int] = None,
 ) -> Tuple[torch.Tensor, ...]:
     """
     Fused linear + DPO preference loss (chunked to avoid materializing logits).
@@ -568,6 +569,9 @@ def dpo_loss(
         label_smoothing: Smoothing factor for "robust" (cDPO) and "exo_pair".
             Default: 0.0
         discopop_tau: Temperature of the DiscoPOP modulation term. Default: 0.05
+        chunk_size: Pairs per chunk. None selects a single pass when the full
+            logits fit in memory and a power-of-2 chunk count otherwise.
+            Chunking never changes results. Default: None
 
     Returns:
         Tuple (loss, chosen_logps, rejected_logps, chosen_logits_mean,
