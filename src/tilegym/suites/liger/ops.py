@@ -531,8 +531,6 @@ def dpo_loss(
     use_ref_model: bool = True,
     average_log_prob: bool = False,
     loss_type: str = "sigmoid",
-    label_smoothing: float = 0.0,
-    discopop_tau: float = 0.05,
     chunk_size: Optional[int] = None,
 ) -> Tuple[torch.Tensor, ...]:
     """
@@ -563,12 +561,8 @@ def dpo_loss(
             when False the reference log-probs are treated as zero. Default: True
         average_log_prob: Average the per-token log-probs over unmasked tokens
             instead of summing them. Default: False
-        loss_type: Preference loss variant: "sigmoid" | "hinge" | "exo_pair" |
-            "nca_pair" | "robust" | "bco_pair" | "sppo_hard" | "apo_zero" |
-            "apo_down" | "discopop". Default: "sigmoid"
-        label_smoothing: Smoothing factor for "robust" (cDPO) and "exo_pair".
-            Default: 0.0
-        discopop_tau: Temperature of the DiscoPOP modulation term. Default: 0.05
+        loss_type: Preference loss variant. Only "sigmoid" (the original DPO
+            loss) is supported for now. Default: "sigmoid"
         chunk_size: Pairs per chunk. None selects a single pass when the full
             logits fit in memory and a power-of-2 chunk count otherwise.
             Chunking never changes results. Default: None

@@ -9,7 +9,7 @@ Computes the Direct Preference Optimization loss over stacked chosen/rejected
 sequence pairs without materializing the full (B*T, V) logit tensor, following
 the chunked backward-in-forward structure of fused_linear_cross_entropy.py.
 
-Every DPO loss variant is elementwise over pairs, so chunks that hold whole
+The sigmoid DPO loss is elementwise over pairs, so chunks that hold whole
 pairs (chosen sequence i with rejected sequence i + n_pairs) contribute
 independently to the loss and every gradient. This keeps the chunked path
 single-pass: within a chunk the logits buffer stays live between the row-stats
@@ -26,22 +26,34 @@ Chunked (larger, or chunk_size forced):
   grad_input / grad_weight_f32 / grad_bias accumulated immediately and the
   chunk logits discarded. Backward is an elementwise scale.
 
-Per chunk, cuTile owns the two row-wise kernels (per-row logsumexp, target
-log-prob and row sum; per-row d_logits write), torch/cuBLAS owns the GEMMs,
-and the O(n_pairs) preference math runs as device-resident torch with a tiny
-autograd graph that supplies dLoss/d(seq_logp) for every loss_type.
+Per chunk the row-wise vocab work runs in one cuTile launch: the liger suite's
+tuned cross-entropy kernel (cross_entropy._liger_cross_entropy_kernel) with
+reduction="sum" and no weight / smoothing / softcap returns -log p(target) per
+row and writes softmax - onehot into the logits buffer in place. The pair math
+then gives every row its coefficient dLoss/d(log p), and the buffer is scaled
+by it to become d_logits. torch/cuBLAS keeps the GEMMs; the O(n_pairs)
+preference math stays device-side torch.
 
-NOTE: the two cuTile kernels are currently torch stand-ins (_row_stats and
-_apply_dlogits_) that fix the kernel contracts; they are swapped for
-@ct.kernel implementations during GPU bring-up and nothing else changes.
+Scope: loss_type="sigmoid" (the original DPO loss), as agreed in
+NVIDIA/TileGym#190; the other upstream variants are follow-ups.
 """
 
 from typing import Optional
 
+import cuda.tile as ct
 import torch
 import torch.nn.functional as F
 
 from tilegym.backend import register_impl
+from tilegym.logger import warn_once
+
+from ..cross_entropy import _get_tuned_ce_kernel
+from ..cross_entropy import _select_block_size
+
+_EXPERIMENTAL_MESSAGE = (
+    "liger.dpo_loss (cutile) is an experimental kernel contributed by external GitHub TileGym "
+    "contributors. This kernel has not been fully validated by the core team."
+)
 
 # Single-pass threshold: if the full (B*T, V) logit tensor fits within this
 # limit, run one chunk and defer the gradient GEMMs to backward.
@@ -51,40 +63,49 @@ _MAX_LOGIT_MEMORY_BYTES = 4 * 1024**3  # 4 GB
 _MAX_CHUNK_LOGIT_BYTES = 1 * 1024**3  # 1 GB
 
 
-def _row_stats(logits, target, ignore_index):
-    """Per-row statistics over the vocab. Kernel A contract.
+def _row_logp_(logits, target, ignore_index, write_grad, dummies):
+    """One cuTile launch over the (R, V) logits rows.
 
-    Args:
-        logits: (R, V) logits in compute dtype.
-        target: (R,) int64 target ids; rows with ignore_index are masked.
-        ignore_index: masked target value.
-
-    Returns:
-        logp: (R,) float32 target log-prob, 0.0 for masked rows.
-        lse: (R,) float32 logsumexp of the row.
-        rowsum: (R,) float32 plain sum of the row (masked rows included).
+    Returns logp: (R,) float32 log p(target), 0.0 for rows with ignore_index.
+    With write_grad, logits is overwritten in place with softmax - onehot
+    (zeros for ignored rows), i.e. -d log p / d logits.
     """
-    logits_f = logits.float()
-    lse = torch.logsumexp(logits_f, dim=-1)
-    rowsum = logits_f.sum(dim=-1)
-    valid = target != ignore_index
-    safe_target = torch.where(valid, target, torch.zeros_like(target))
-    target_logit = logits_f.gather(-1, safe_target.unsqueeze(-1)).squeeze(-1)
-    logp = torch.where(valid, target_logit - lse, torch.zeros_like(lse))
-    return logp, lse, rowsum
-
-
-def _apply_dlogits_(logits, target, lse, coeff, ignore_index):
-    """In-place d_logits write. Kernel B contract.
-
-    Overwrites logits with coeff[r] * (softmax(logits[r]) - onehot(target[r])),
-    in the logits dtype. Rows with coeff == 0 come out zero.
-    """
-    p = torch.exp(logits.float() - lse.unsqueeze(-1))
-    valid = target != ignore_index
-    safe_target = torch.where(valid, target, torch.zeros_like(target))
-    p.scatter_add_(-1, safe_target.unsqueeze(-1), -torch.ones_like(safe_target, dtype=p.dtype).unsqueeze(-1))
-    logits.copy_((coeff.unsqueeze(-1) * p).to(logits.dtype))
+    n_rows, V = logits.shape
+    loss = torch.zeros(n_rows, dtype=torch.float32, device=logits.device)
+    dummy_f32, dummy_i64, dummy_weight = dummies
+    block_size = _select_block_size(V, logits.device)
+    kernel = _get_tuned_ce_kernel(V, block_size, logits.dtype, logits.device)
+    ct.launch(
+        torch.cuda.current_stream(),
+        (n_rows, 1, 1),
+        kernel,
+        (
+            logits,
+            target,
+            dummy_weight,
+            loss,
+            dummy_f32,  # z_loss
+            dummy_f32,  # token_accuracy
+            dummy_i64,  # predicted_tokens
+            int(V),
+            1.0,  # inv_n_non_ignore (unused: REDUCTION_MEAN=0)
+            1.0,  # sum_non_ignore_weight (unused)
+            0.0,  # weight_sum (unused)
+            int(ignore_index),
+            0.0,  # label_smoothing
+            0.0,  # lse_square_scale
+            0.0,  # softcap
+            int(block_size),
+            int(write_grad),  # HAS_GRADIENTS
+            0,  # REDUCTION_MEAN
+            0,  # HAS_WEIGHT
+            0,  # HAS_SOFTCAPPING
+            0,  # RETURN_Z_LOSS
+            0,  # RETURN_TOKEN_ACCURACY
+            0,  # RETURN_PREDICTED_TOKENS
+        ),
+    )
+    return -loss
 
 
 def _preference_loss_terms(
@@ -94,13 +115,10 @@ def _preference_loss_terms(
     ref_rejected_logps,
     n_pairs_total,
     beta,
-    loss_type,
-    label_smoothing,
-    discopop_tau,
 ):
-    """DPO preference loss variants over one chunk's pairs, normalized by the
-    GLOBAL pair count so chunk contributions sum to the full-batch loss.
-    Formulas follow Liger-Kernel chunked_loss/dpo_loss.py (ead96b618e5c)."""
+    """Sigmoid DPO loss over one chunk's pairs, normalized by the GLOBAL pair
+    count so chunk contributions sum to the full-batch loss.
+    Formula follows Liger-Kernel chunked_loss/dpo_loss.py (ead96b618e5c)."""
     chosen_logratios = chosen_logps - ref_chosen_logps
     rejected_logratios = rejected_logps - ref_rejected_logps
 
@@ -108,41 +126,7 @@ def _preference_loss_terms(
     rejected_rewards = beta * rejected_logratios
 
     logits_diff = beta * (chosen_logratios - rejected_logratios)
-
-    if loss_type == "sigmoid":
-        losses = -F.logsigmoid(logits_diff)
-    elif loss_type == "hinge":
-        losses = torch.relu(1 - logits_diff)
-    elif loss_type == "exo_pair":
-        epsilon = torch.tensor(label_smoothing, device=chosen_logps.device)
-        qw = torch.sigmoid(logits_diff)
-        ql = torch.sigmoid(-logits_diff)
-        losses = qw * (F.logsigmoid(logits_diff) - torch.log1p(-epsilon)) + ql * (
-            F.logsigmoid(-logits_diff) - torch.log(epsilon)
-        )
-    elif loss_type == "nca_pair":
-        losses = (
-            -F.logsigmoid(chosen_rewards) - 0.5 * F.logsigmoid(-chosen_rewards) - 0.5 * F.logsigmoid(-rejected_rewards)
-        )
-    elif loss_type == "robust":
-        clean_loss_term = -(1 - label_smoothing) * F.logsigmoid(logits_diff)
-        flipped_loss_term = -label_smoothing * F.logsigmoid(-logits_diff)
-        losses = (clean_loss_term - flipped_loss_term) / (1 - 2 * label_smoothing)
-    elif loss_type == "bco_pair":
-        losses = -F.logsigmoid(chosen_rewards) - F.logsigmoid(-rejected_rewards)
-    elif loss_type == "sppo_hard":
-        losses = (chosen_logratios - 0.5 / beta) ** 2 + (rejected_logratios + 0.5 / beta) ** 2
-    elif loss_type == "apo_zero":
-        losses = (1 - F.sigmoid(beta * chosen_logratios)) + F.sigmoid(beta * rejected_logratios)
-    elif loss_type == "apo_down":
-        losses = F.sigmoid(beta * chosen_logratios) + (1 - F.sigmoid(beta * (chosen_logratios - rejected_logratios)))
-    elif loss_type == "discopop":
-        log_ratio_modulation = torch.sigmoid(logits_diff / discopop_tau)
-        logistic_component = -F.logsigmoid(logits_diff)
-        exp_component = torch.exp(-logits_diff)
-        losses = logistic_component * (1 - log_ratio_modulation) + exp_component * log_ratio_modulation
-    else:
-        raise ValueError(f"Unsupported loss_type: {loss_type}")
+    losses = -F.logsigmoid(logits_diff)
 
     loss = losses.sum() / n_pairs_total
     return loss, chosen_rewards, rejected_rewards
@@ -155,9 +139,6 @@ def _pair_math(
     ref_rejected_logps,
     n_pairs_total,
     beta,
-    loss_type,
-    label_smoothing,
-    discopop_tau,
 ):
     """Preference loss for one chunk plus dLoss/d(seq_logp) via a tiny
     autograd graph over the (chunk_pairs,) log-prob vectors."""
@@ -171,9 +152,6 @@ def _pair_math(
             ref_rejected_logps,
             n_pairs_total,
             beta,
-            loss_type,
-            label_smoothing,
-            discopop_tau,
         )
         g_chosen, g_rejected = torch.autograd.grad(loss, (c, r))
     return loss.detach(), chosen_rewards.detach(), rejected_rewards.detach(), g_chosen, g_rejected
@@ -201,9 +179,6 @@ class DPOLossCuTileFunction(torch.autograd.Function):
         compute_nll_loss,
         use_ref_model,
         average_log_prob,
-        loss_type,
-        label_smoothing,
-        discopop_tau,
         chunk_size,
     ):
         B, T, H = _input.shape
@@ -230,6 +205,14 @@ class DPOLossCuTileFunction(torch.autograd.Function):
         if average_log_prob:
             tok_w = tok_w / mask.sum(dim=-1, keepdim=True).to(torch.float32)
         n_chosen_valid = mask[:n_pairs].sum()
+
+        _input = _input.contiguous()
+        target = target.contiguous()
+        dummies = (
+            torch.zeros(1, dtype=torch.float32, device=device),
+            torch.zeros(1, dtype=torch.int64, device=device),
+            torch.zeros(1, dtype=torch.float32, device=device),
+        )
 
         loss_acc = torch.zeros((), device=device, dtype=torch.float32)
         nll_acc = torch.zeros((), device=device, dtype=torch.float32)
@@ -262,7 +245,9 @@ class DPOLossCuTileFunction(torch.autograd.Function):
             if bias is not None:
                 logits_c = logits_c + bias
 
-            logp, lse, rowsum = _row_stats(logits_c, target_flat, ignore_index)
+            # Row sums feed the logits-mean outputs; take them before the kernel overwrites logits.
+            rowsum = torch.sum(logits_c, dim=-1, dtype=torch.float32)
+            logp = _row_logp_(logits_c, target_flat, ignore_index, True, dummies)
 
             if use_ref_model:
                 with torch.no_grad():
@@ -270,7 +255,7 @@ class DPOLossCuTileFunction(torch.autograd.Function):
                     ref_logits_c = ref_x_2d @ ref_weight.t()
                     if ref_bias is not None:
                         ref_logits_c = ref_logits_c + ref_bias
-                    ref_logp, _, _ = _row_stats(ref_logits_c, target_flat, ignore_index)
+                    ref_logp = _row_logp_(ref_logits_c.contiguous(), target_flat, ignore_index, False, dummies)
                     del ref_logits_c
                 ref_seq_logp = (ref_logp.view(2 * cp, T) * tok_w_c).sum(dim=-1)
                 ref_chosen_logps = ref_seq_logp[:cp]
@@ -290,9 +275,6 @@ class DPOLossCuTileFunction(torch.autograd.Function):
                 ref_rejected_logps,
                 n_pairs,
                 beta,
-                loss_type,
-                label_smoothing,
-                discopop_tau,
             )
             loss_acc += pref_loss_c
             chosen_logps_parts.append(chosen_logps_c)
@@ -311,7 +293,8 @@ class DPOLossCuTileFunction(torch.autograd.Function):
                 nll_acc += -logp_2d[:cp].sum() / n_chosen_valid
                 coeff[:cp] += (alpha / n_chosen_valid) * mask[p0:p1].to(torch.float32)
 
-            _apply_dlogits_(logits_c, target_flat, lse, coeff.reshape(rows), ignore_index)
+            # logits_c holds softmax - onehot; scale each row by its coefficient to get d_logits.
+            logits_c.mul_(coeff.reshape(rows, 1).to(logits_c.dtype))
 
             if single_pass:
                 d_logits_saved = logits_c
@@ -390,9 +373,6 @@ class DPOLossCuTileFunction(torch.autograd.Function):
             None,  # compute_nll_loss
             None,  # use_ref_model
             None,  # average_log_prob
-            None,  # loss_type
-            None,  # label_smoothing
-            None,  # discopop_tau
             None,  # chunk_size
         )
 
@@ -413,10 +393,13 @@ def dpo_loss_cutile(
     use_ref_model: bool = True,
     average_log_prob: bool = False,
     loss_type: str = "sigmoid",
-    label_smoothing: float = 0.0,
-    discopop_tau: float = 0.05,
     chunk_size: Optional[int] = None,
 ):
+    if loss_type != "sigmoid":
+        raise ValueError(f"dpo_loss (cutile) supports loss_type='sigmoid' only, got {loss_type!r}")
+    if use_ref_model and (ref_input is None or ref_weight is None):
+        raise ValueError("use_ref_model=True requires ref_input and ref_weight")
+    warn_once(_EXPERIMENTAL_MESSAGE, "EXPERIMENTAL")
     return DPOLossCuTileFunction.apply(
         input,
         weight,
@@ -431,8 +414,5 @@ def dpo_loss_cutile(
         compute_nll_loss,
         use_ref_model,
         average_log_prob,
-        loss_type,
-        label_smoothing,
-        discopop_tau,
         chunk_size,
     )

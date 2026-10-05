@@ -40,12 +40,9 @@ def _preference_loss(
     ref_chosen_logps,
     ref_rejected_logps,
     beta=0.1,
-    loss_type="sigmoid",
-    label_smoothing=0.0,
-    discopop_tau=0.05,
 ):
-    """DPO preference loss variants, transcribed from Liger-Kernel
-    chunked_loss/dpo_loss.py (commit ead96b618e5c)."""
+    """Sigmoid DPO loss, transcribed from Liger-Kernel chunked_loss/dpo_loss.py
+    (commit ead96b618e5c)."""
     chosen_logratios = chosen_logps - ref_chosen_logps
     rejected_logratios = rejected_logps - ref_rejected_logps
 
@@ -53,56 +50,7 @@ def _preference_loss(
     rejected_rewards = beta * rejected_logratios
 
     logits_diff = beta * (chosen_logratios - rejected_logratios)
-
-    if loss_type == "sigmoid":
-        loss = -F.logsigmoid(logits_diff).sum() / n_pairs
-    elif loss_type == "hinge":
-        loss = torch.relu(1 - logits_diff).sum() / n_pairs
-    elif loss_type == "exo_pair":
-        epsilon = torch.tensor(label_smoothing, device=chosen_logps.device)
-        qw = torch.sigmoid(logits_diff)
-        log_qw = F.logsigmoid(logits_diff)
-        log_pw = torch.log1p(-epsilon)
-        ql = torch.sigmoid(-logits_diff)
-        log_ql = F.logsigmoid(-logits_diff)
-        log_pl = torch.log(epsilon)
-        losses = qw * (log_qw - log_pw) + ql * (log_ql - log_pl)
-        loss = losses.sum() / n_pairs
-    elif loss_type == "nca_pair":
-        losses = (
-            -F.logsigmoid(chosen_rewards) - 0.5 * F.logsigmoid(-chosen_rewards) - 0.5 * F.logsigmoid(-rejected_rewards)
-        )
-        loss = losses.sum() / n_pairs
-    elif loss_type == "robust":
-        clean_loss_term = -(1 - label_smoothing) * F.logsigmoid(logits_diff)
-        flipped_loss_term = -label_smoothing * F.logsigmoid(-logits_diff)
-        losses = (clean_loss_term - flipped_loss_term) / (1 - 2 * label_smoothing)
-        loss = losses.sum() / n_pairs
-    elif loss_type == "bco_pair":
-        losses = -F.logsigmoid(chosen_rewards) - F.logsigmoid(-rejected_rewards)
-        loss = losses.sum() / n_pairs
-    elif loss_type == "sppo_hard":
-        a = chosen_logps - ref_chosen_logps
-        b = rejected_logps - ref_rejected_logps
-        losses = (a - 0.5 / beta) ** 2 + (b + 0.5 / beta) ** 2
-        loss = losses.sum() / n_pairs
-    elif loss_type == "apo_zero":
-        losses_chosen = 1 - F.sigmoid(beta * chosen_logratios)
-        losses_rejected = F.sigmoid(beta * rejected_logratios)
-        loss = (losses_chosen + losses_rejected).sum() / n_pairs
-    elif loss_type == "apo_down":
-        losses_chosen = F.sigmoid(beta * chosen_logratios)
-        losses_rejected = 1 - F.sigmoid(beta * (chosen_logratios - rejected_logratios))
-        loss = (losses_chosen + losses_rejected).sum() / n_pairs
-    elif loss_type == "discopop":
-        log_ratio_modulation = torch.sigmoid(logits_diff / discopop_tau)
-        logistic_component = -F.logsigmoid(logits_diff)
-        exp_component = torch.exp(-logits_diff)
-        losses = logistic_component * (1 - log_ratio_modulation) + exp_component * log_ratio_modulation
-        loss = losses.sum() / n_pairs
-    else:
-        raise ValueError(f"Unsupported loss_type: {loss_type}")
-
+    loss = -F.logsigmoid(logits_diff).sum() / n_pairs
     return loss, chosen_rewards, rejected_rewards
 
 
@@ -120,9 +68,6 @@ def _reference_dpo_loss(
     compute_nll_loss=False,
     use_ref_model=True,
     average_log_prob=False,
-    loss_type="sigmoid",
-    label_smoothing=0.0,
-    discopop_tau=0.05,
 ):
     """Unchunked PyTorch reference for the fused linear + DPO loss.
 
@@ -172,9 +117,6 @@ def _reference_dpo_loss(
         ref_chosen_logps,
         ref_rejected_logps,
         beta=beta,
-        loss_type=loss_type,
-        label_smoothing=label_smoothing,
-        discopop_tau=discopop_tau,
     )
 
     loss = alpha * nll_loss + pref_loss
@@ -266,32 +208,14 @@ class Test_Liger_DpoLoss(common.PyTestCase):
         ref_out = _reference_dpo_loss(*inputs)
         _assert_outputs_match(test_out, ref_out, dtype)
 
-    @pytest.mark.parametrize(
-        "loss_type, label_smoothing",
-        [
-            ("sigmoid", 0.0),
-            ("hinge", 0.0),
-            ("exo_pair", 1e-3),
-            ("nca_pair", 0.0),
-            ("robust", 0.1),
-            ("bco_pair", 0.0),
-            ("sppo_hard", 0.0),
-            ("apo_zero", 0.0),
-            ("apo_down", 0.0),
-            ("discopop", 0.0),
-        ],
-    )
+    @pytest.mark.parametrize("loss_type", ["hinge", "ipo", "robust"])
     @pytest.mark.parametrize("backend", _backends)
-    def test_op_loss_types(self, loss_type, label_smoothing, backend, monkeypatch):
-        """Every upstream loss_type variant matches the reference."""
+    def test_op_rejects_non_sigmoid(self, loss_type, backend, monkeypatch):
+        """Only the sigmoid loss is supported; other variants fail loudly."""
         device = self._setup_backend(backend)
-        n_pairs, T, H, V = 2, 8, 64, 128
-        dtype = torch.float32
-        inputs = _make_inputs(n_pairs, T, H, V, dtype, device, with_ref=True, prompt_len=2)
-
-        test_out = dpo_loss(*inputs, loss_type=loss_type, label_smoothing=label_smoothing)
-        ref_out = _reference_dpo_loss(*inputs, loss_type=loss_type, label_smoothing=label_smoothing)
-        _assert_outputs_match(test_out, ref_out, dtype, what=f"[{loss_type}] ")
+        inputs = _make_inputs(2, 8, 64, 128, torch.float32, device, with_ref=True, prompt_len=2)
+        with pytest.raises(ValueError, match="sigmoid"):
+            dpo_loss(*inputs, loss_type=loss_type)
 
     @pytest.mark.parametrize("backend", _backends)
     def test_op_no_ref_model(self, backend, monkeypatch):
