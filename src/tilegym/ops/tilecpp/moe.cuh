@@ -69,7 +69,7 @@
  *   STRIDE_ASM, STRIDE_ASK: A scale strides
  *   STRIDE_BSE, STRIDE_BSK, STRIDE_BSN: B scale strides
  */
-template<typename OUT_T, typename IN_T,
+template<typename OUT_T, typename IN_T, typename WEIGHT_T,
          int BLOCK_SIZE_M, int BLOCK_SIZE_N, int BLOCK_SIZE_K, int GROUP_SIZE_M,
          bool MUL_ROUTED_WEIGHT, bool USE_FP8_SCALES,
          int N, int K, int GROUP_N, int GROUP_K, int TOP_K,
@@ -77,13 +77,16 @@ template<typename OUT_T, typename IN_T,
          int STRIDE_CM, int STRIDE_CN,
          int STRIDE_ASM, int STRIDE_ASK, int STRIDE_BSE, int STRIDE_BSK, int STRIDE_BSN,
          int EM>
+#if (__CUDACC_VER_MAJOR__ > 13) || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4)
+[[cutile::hint(1200, num_worker_warps_per_cta=(K >= 512 ? 8 : 4))]]
+#endif
 __tile_global__ void fused_moe_kernel(
     const IN_T* __restrict__ a_ptr,      // Input tokens (M, K)
     const IN_T* __restrict__ b_ptr,      // Expert weights (E, N, K)
     OUT_T* __restrict__ c_ptr,           // Output (num_valid_tokens, N)
     const float* __restrict__ a_scale_ptr,      // A scales [M, K/BLOCK_K] (optional, for FP8)
     const float* __restrict__ b_scale_ptr,      // B scales [E, N/BLOCK_N, K/BLOCK_K] (optional, for FP8)
-    const float* __restrict__ topk_weights_ptr, // Routing weights (num_valid_tokens,) - always FP32
+    const WEIGHT_T* __restrict__ topk_weights_ptr,
     const int* __restrict__ sorted_token_ids_ptr,  // Sorted token indices
     const int* __restrict__ expert_ids_ptr,   // Expert index per M-block
     const int* __restrict__ num_tokens_post_padded_ptr,
@@ -109,7 +112,6 @@ __tile_global__ void fused_moe_kernel(
     c_ptr = ct::assume_aligned<16>(c_ptr);
     a_scale_ptr = ct::assume_aligned<16>(a_scale_ptr);
     b_scale_ptr = ct::assume_aligned<16>(b_scale_ptr);
-    topk_weights_ptr = ct::assume_aligned<16>(topk_weights_ptr);
     sorted_token_ids_ptr = ct::assume_aligned<16>(sorted_token_ids_ptr);
     expert_ids_ptr = ct::assume_aligned<16>(expert_ids_ptr);
     num_tokens_post_padded_ptr = ct::assume_aligned<16>(num_tokens_post_padded_ptr);
@@ -200,8 +202,8 @@ __tile_global__ void fused_moe_kernel(
         if constexpr (MUL_ROUTED_WEIGHT) {
             using f32_M = ct::tile<float, ct::shape<BLOCK_SIZE_M>>;
             auto weight_ptrs = topk_weights_ptr + offs_token;
-            auto zero_pad = ct::zeros<f32_M>();
-            auto moe_weight = ct::load_masked(weight_ptrs, token_mask, zero_pad);
+            auto moe_weight = ct::element_cast<float>(
+                ct::load_masked(weight_ptrs, token_mask, zero_scalar<WEIGHT_T>()));
             auto moe_weight_2d = ct::reshape(moe_weight, ct::shape<BLOCK_SIZE_M, 1>{});
             accumulator = accumulator * moe_weight_2d;
         }
