@@ -256,14 +256,14 @@ class Test_Liger_DpoLoss(common.PyTestCase):
         ref_out = _reference_dpo_loss(*inputs)
         _assert_outputs_match(test_out, ref_out, dtype)
 
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
     @pytest.mark.parametrize("chunk_size", [1, 2, 3, None])
     @pytest.mark.parametrize("backend", _backends)
-    def test_op_chunk_sizes(self, chunk_size, backend, monkeypatch):
+    def test_op_chunk_sizes(self, chunk_size, dtype, backend, monkeypatch):
         """Forced chunking (including a non-divisor chunk count) never changes
         results relative to the reference or the single-pass path."""
         device = self._setup_backend(backend)
         n_pairs, T, H, V = 4, 8, 64, 128
-        dtype = torch.float32
         input_data, weight, target, bias, ref_input, ref_weight, ref_bias = _make_inputs(
             n_pairs, T, H, V, dtype, device, with_bias=True, with_ref=True, prompt_len=2
         )

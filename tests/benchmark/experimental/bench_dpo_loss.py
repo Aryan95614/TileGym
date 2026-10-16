@@ -46,7 +46,7 @@ def _torch_dpo_loss(x, w, target, ref_x, ref_w, beta=0.1):
     return -F.logsigmoid(diff).sum() / n_pairs
 
 
-def _create_config(ylabel, kind, hidden_size, vocab_size, seq_len, datatype):
+def _create_config(ylabel, kind, unit, hidden_size, vocab_size, seq_len, datatype):
     available = _supported_backends()
     if not available:
         return None
@@ -60,7 +60,7 @@ def _create_config(ylabel, kind, hidden_size, vocab_size, seq_len, datatype):
         line_names=list(names),
         styles=list(styles),
         ylabel=ylabel,
-        plot_name=f"dpo-loss-{kind}-T{seq_len}-H{hidden_size}-V{vocab_size}-{dtype_name}",
+        plot_name=f"dpo-loss-{kind}-T{seq_len}-H{hidden_size}-V{vocab_size}-{dtype_name}-{unit}",
         args={"hidden_size": hidden_size, "vocab_size": vocab_size, "seq_len": seq_len, "datatype": datatype},
     )
 
@@ -88,13 +88,19 @@ def _fwd_bwd(backend, x, w, t, ref_x, ref_w):
 _CONFIGS = [(4096, 128256, 1024, torch.bfloat16)]
 
 
-@triton.testing.perf_report([_create_config("ms", "fwd-bwd-latency", H, V, T, dt) for H, V, T, dt in _CONFIGS])
+def _dpo_flops(n_pairs, seq_len, hidden_size, vocab_size):
+    """Nominal matmul work of one fwd+bwd step: policy fwd, reference fwd, and the dX and dW backward GEMMs."""
+    return 8 * (2 * n_pairs) * seq_len * hidden_size * vocab_size
+
+
+@triton.testing.perf_report([_create_config("TFLOPS", "fwd-bwd", "TFLOPS", H, V, T, dt) for H, V, T, dt in _CONFIGS])
 def bench_dpo_loss(n_pairs, backend, hidden_size, vocab_size, seq_len, datatype, device=DEVICE):
     x, w, t, ref_x, ref_w = _make(n_pairs, seq_len, hidden_size, vocab_size, datatype, device)
-    return triton.testing.do_bench(lambda: _fwd_bwd(backend, x, w, t, ref_x, ref_w), grad_to_none=[x, w])
+    ms = triton.testing.do_bench(lambda: _fwd_bwd(backend, x, w, t, ref_x, ref_w), grad_to_none=[x, w])
+    return _dpo_flops(n_pairs, seq_len, hidden_size, vocab_size) * 1e-12 / (ms * 1e-3)
 
 
-@triton.testing.perf_report([_create_config("GB", "peak-memory", H, V, T, dt) for H, V, T, dt in _CONFIGS])
+@triton.testing.perf_report([_create_config("GB/s", "peak-memory", "GBps", H, V, T, dt) for H, V, T, dt in _CONFIGS])
 def bench_dpo_loss_memory(n_pairs, backend, hidden_size, vocab_size, seq_len, datatype, device=DEVICE):
     x, w, t, ref_x, ref_w = _make(n_pairs, seq_len, hidden_size, vocab_size, datatype, device)
     torch.cuda.synchronize()
@@ -104,7 +110,10 @@ def bench_dpo_loss_memory(n_pairs, backend, hidden_size, vocab_size, seq_len, da
     except torch.OutOfMemoryError:
         return float("nan")
     torch.cuda.synchronize()
-    return torch.cuda.max_memory_allocated() * 1e-9
+    peak_memory_bytes = torch.cuda.max_memory_allocated()
+
+    ms = triton.testing.do_bench(lambda: _fwd_bwd(backend, x, w, t, ref_x, ref_w), grad_to_none=[x, w])
+    return peak_memory_bytes * 1e-9 / (ms * 1e-3)
 
 
 if __name__ == "__main__":
