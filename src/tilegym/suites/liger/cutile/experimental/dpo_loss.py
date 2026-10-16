@@ -49,6 +49,8 @@ from tilegym.logger import warn_once
 
 from ..cross_entropy import _get_tuned_ce_kernel
 from ..cross_entropy import _select_block_size
+from ..utils import addmm_f32_
+from ..utils import mm_f32
 
 _EXPERIMENTAL_MESSAGE = (
     "liger.dpo_loss (cutile) is an experimental kernel contributed by external GitHub TileGym "
@@ -61,28 +63,6 @@ _MAX_LOGIT_MEMORY_BYTES = 4 * 1024**3  # 4 GB
 
 # Chunked path: largest power-of-2 pair count whose logits fit this budget.
 _MAX_CHUNK_LOGIT_BYTES = 1 * 1024**3  # 1 GB
-
-
-def _mm_f32(a, b):
-    """a @ b with an fp32 result. For bf16/fp16 inputs this stays on tensor cores (fp32 accumulate and output)
-    instead of upcasting both operands, which would fall back to an fp32 SIMT GEMM; the result matches the
-    upcast product to fp32 precision because bf16/fp16 products are exact in fp32."""
-    if a.dtype == torch.float32:
-        return a @ b
-    try:
-        return torch.mm(a, b, out_dtype=torch.float32)
-    except TypeError:  # torch without mm(out_dtype=...)
-        return a.float() @ b.float()
-
-
-def _addmm_f32_(acc, a, b):
-    """acc += a @ b in place on an fp32 accumulator, with the accumulation done inside the GEMM (beta=1)."""
-    if a.dtype == torch.float32:
-        return acc.addmm_(a, b)
-    try:
-        return torch.addmm(acc, a, b, out_dtype=torch.float32, out=acc)
-    except TypeError:  # torch without addmm(out_dtype=...)
-        return acc.add_(a.float() @ b.float())
 
 
 def _row_logp_(logits, target, ignore_index, write_grad, dummies):
@@ -324,7 +304,7 @@ class DPOLossCuTileFunction(torch.autograd.Function):
                 grad_x_c = (logits_c @ weight).view(2 * cp, T, H)
                 grad_input[p0:p1] = grad_x_c[:cp]
                 grad_input[n_pairs + p0 : n_pairs + p1] = grad_x_c[cp:]
-                _addmm_f32_(grad_weight_f32, logits_c.t(), x_2d)
+                addmm_f32_(grad_weight_f32, logits_c.t(), x_2d)
                 if bias is not None:
                     grad_bias_f32 += torch.sum(logits_c, dim=0, dtype=torch.float32)
                 del logits_c
@@ -372,7 +352,7 @@ class DPOLossCuTileFunction(torch.autograd.Function):
             x_2d = _input.reshape(B * T, H)
             grad_x = (d_logits @ weight).view(B, T, H) * grad_loss
             grad_input = grad_x.to(ctx.input_dtype)
-            grad_weight = _mm_f32(d_logits.t(), x_2d) * grad_loss
+            grad_weight = mm_f32(d_logits.t(), x_2d) * grad_loss
             grad_weight = grad_weight.to(ctx.weight_dtype)
             grad_bias = (
                 (torch.sum(d_logits, dim=0, dtype=torch.float32) * grad_loss).to(ctx.weight_dtype)
