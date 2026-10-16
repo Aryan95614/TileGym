@@ -35,6 +35,7 @@ import torch
 from tilegym.backend import register_impl
 
 from .cross_entropy import _get_tuned_ce_kernel
+from .utils import addmm_f32_
 from .utils import next_power_of_2
 
 MAX_FUSED_SIZE = 65536 // 2
@@ -56,23 +57,6 @@ def _chunk_size_for(V: int, element_size: int) -> int:
         return 1
     # floor to power of 2
     return 1 << (max_rows.bit_length() - 1)
-
-
-def _addmm_f32_(acc, a, b):
-    """acc += a @ b on an fp32 accumulator, accumulating inside the GEMM (beta=1).
-
-    bf16/fp16 operands stay on tensor cores with fp32 accumulate and output, the same
-    choice the single-pass backward makes below. Upcasting both operands instead runs
-    an fp32 SIMT GEMM and materializes fp32 copies of the chunk. Falls back to the
-    upcast product for mixed dtypes or torch builds without ``out_dtype``.
-    """
-    if a.dtype == b.dtype and a.dtype in (torch.bfloat16, torch.float16):
-        try:
-            torch.addmm(acc, a, b, out_dtype=torch.float32, out=acc)
-            return acc
-        except (TypeError, RuntimeError):
-            pass
-    return acc.add_(a.float() @ b.float())
 
 
 def _launch_ce(
@@ -324,7 +308,7 @@ def _fused_linear_ce_forward_ct(
             if grad_input_saved is not None:
                 grad_input_saved[start_idx:end_idx] = grad_logits_chunk.to(_input.dtype) @ weight
             if grad_weight_f32 is not None:
-                _addmm_f32_(grad_weight_f32, grad_logits_chunk.t(), _input_chunk)
+                addmm_f32_(grad_weight_f32, grad_logits_chunk.t(), _input_chunk)
             if grad_bias_saved is not None:
                 grad_bias_saved += grad_logits_chunk.sum(dim=0).to(grad_bias_saved.dtype)
 
